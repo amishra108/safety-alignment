@@ -1,0 +1,1522 @@
+#!/usr/bin/env python3
+
+"""
+Layer-26 text-derived harmfulness steering experiment.
+
+Models:
+    qwen2_audio
+    kimi_audio
+    qwen25_omni
+
+Dataset:
+    Audio Jailbreak Clean Benchmark.
+    3,200 source examples, each evaluated as text and audio.
+    6,400 generations per model.
+
+Representation:
+    Final prompt-token hidden state.
+    Boundary 26: output of transformer block 26, zero-based index 25.
+
+Direction:
+    Text-trained harmful-minus-benign SVD-1 direction.
+    Derived from the corresponding 5-fold training partition.
+    Each example receives the direction from its held-out fold.
+
+Intervention:
+    h_26' = h_26 + strength * gap_26 * w_26
+
+    w_26:
+        Unit-norm text-trained SVD-1 direction.
+
+    gap_26:
+        Training mean harmful-minus-benign projection difference.
+
+    strength:
+        Dimensionless steering coefficient.
+
+Timing:
+    Prompt prefill only.
+    Final prompt-token position only.
+    Exactly one intervention per generation.
+    No direct intervention on generated-token activations.
+
+Baseline:
+    The original corrected generator supplies:
+        Model loading
+        Prompt construction
+        Audio preprocessing
+        Generation arguments
+        Response decoding
+        JSONL record construction
+        Sharding and merging
+
+    This script wraps its inference functions without reimplementing them.
+
+Outputs:
+    results/INITIAL_BENCHMARK/<model>/wk3/
+        steering_layer26_text_svd1/
+            strength_<value>/
+                responses.all.text.jsonl
+                responses.all.audio.jsonl
+                shards/
+
+    The original output fields remain unchanged.
+    An additional "steering" object records intervention metadata.
+
+Safety checks:
+    Exact model-specific decoder resolution.
+    Direction/hidden-dimension validation.
+    Explicit five-fold topic assignment validation.
+    Exactly one prompt-prefill intervention.
+    Finite steering vectors and activations.
+    No overwriting of baseline generation outputs.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import os
+import json
+import importlib.util
+import math
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+ROOT = Path("/research/milsrg1/user_workspace/am3244/safety-alignment")
+
+GENERATOR = (
+    ROOT
+    / "scripts/initial_benchmark/audio_jailbreak_clean_benchmark"
+    / "03_run_all_models_final_corrected_.py"
+)
+
+SVD_SCRIPT = ROOT / "scripts/wk3/02_paired_harm_svd.py"
+
+OUTPUT_ROOT = (
+    ROOT
+    / "results/INITIAL_BENCHMARK"
+)
+
+EXPERIMENT = {
+    "name": "layer26_text_svd1_prefill_last",
+    "layer_boundary": 26,
+    "block_index": 25,
+    "direction_source": "text",
+    "direction_method": "svd_1",
+    "injection_position": "last_prompt_token",
+    "injection_phase": "prefill_only",
+    "injections_per_generation": 1,
+    "scaling": "strength_times_training_harmful_benign_gap",
+    "generation_max_new_tokens": 1024,
+}
+
+MODEL_COMPONENTS = {
+    "qwen2_audio": "decoder",
+    "kimi_audio": "shared_decoder",
+    "qwen25_omni": "thinker",
+}
+
+DECODER_DEPTHS = {
+    "qwen2_audio": 32,
+    "kimi_audio": 28,
+    "qwen25_omni": 28,
+}
+
+DEFAULT_STRENGTH = 0.1
+
+
+def import_module(name, path):
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    spec = importlib.util.spec_from_file_location(name, path)
+
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot import {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+
+    return module
+
+
+def resolve_path(root, path):
+    value = root
+
+    for part in path.split("."):
+        if not hasattr(value, part):
+            raise RuntimeError(
+                f"Missing module attribute {part!r} in {path!r}"
+            )
+        value = getattr(value, part)
+
+    return value
+
+
+def resolve_decoder(model, model_name):
+    expected = DECODER_DEPTHS[model_name]
+
+    if model_name == "qwen2_audio":
+        candidates = []
+
+        for name, module in model.named_modules():
+            if not isinstance(module, torch.nn.ModuleList):
+                continue
+
+            if len(module) != expected:
+                continue
+
+            classes = {child.__class__.__name__ for child in module}
+
+            if classes == {"Qwen2DecoderLayer"}:
+                candidates.append((name, module))
+
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "Qwen2-Audio: expected exactly one "
+                f"{expected}-layer Qwen2DecoderLayer stack; "
+                f"found {[(name, len(layers)) for name, layers in candidates]}"
+            )
+
+        stack_path, layers = candidates[0]
+
+    elif model_name == "kimi_audio":
+        stack_path = "alm.model.layers"
+        layers = resolve_path(model, stack_path)
+
+    elif model_name == "qwen25_omni":
+        stack_path = "thinker.model.layers"
+        layers = resolve_path(model, stack_path)
+
+    else:
+        raise ValueError(model_name)
+
+    if not isinstance(layers, (torch.nn.ModuleList, list)):
+        raise RuntimeError(
+            f"{model_name}: decoder stack has unexpected type "
+            f"{type(layers).__name__}"
+        )
+
+    if len(layers) != expected:
+        raise RuntimeError(
+            f"{model_name}: expected {expected} blocks, "
+            f"found {len(layers)} at {stack_path}"
+        )
+
+    block_index = EXPERIMENT["block_index"]
+    block = layers[block_index]
+
+    print(
+        f"[architecture] model={model_name} "
+        f"stack={stack_path} "
+        f"blocks={len(layers)} "
+        f"boundary={EXPERIMENT['layer_boundary']} "
+        f"block_index={block_index} "
+        f"block_type={block.__class__.__name__}",
+        flush=True,
+    )
+
+    return f"{stack_path}.{block_index}", block
+
+
+def read_manifest(generator):
+    rows = generator.load_examples()
+
+    if len(rows) != 3200:
+        raise RuntimeError(
+            f"Expected 3200 manifest examples; found {len(rows)}"
+        )
+
+    ids = [row["example_id"] for row in rows]
+
+    if len(ids) != len(set(ids)):
+        raise RuntimeError("Duplicate manifest example_id")
+
+    return rows
+
+
+def build_fold_mapping(svd, model_name, manifest):
+    assignments = svd.fold_assignments(model_name)
+
+    if set(assignments) != set(range(100)):
+        raise RuntimeError(
+            f"{model_name}: expected integer topic IDs 0..99"
+        )
+
+    lookup = {}
+    topic_counts = {}
+    source_ids = set()
+
+    for row in manifest:
+        example_id = row["example_id"]
+        source_id = row["source_id"]
+        split = row["split"]
+
+        match = re.fullmatch(
+            r"jbb_(benign|harmful)_(\d{3})",
+            source_id,
+        )
+
+        if match is None:
+            raise RuntimeError(
+                f"{example_id}: invalid source_id {source_id!r}"
+            )
+
+        source_split, topic_string = match.groups()
+        topic = int(topic_string)
+
+        if source_split != split:
+            raise RuntimeError(
+                f"{example_id}: source_id/split mismatch"
+            )
+
+        if not 0 <= topic < 100:
+            raise RuntimeError(
+                f"{example_id}: invalid topic index {topic}"
+            )
+
+        if not example_id.startswith(source_id + "__"):
+            raise RuntimeError(
+                f"{example_id}: source_id/example_id mismatch"
+            )
+
+        fold = int(assignments[topic])
+
+        if fold not in range(1, 6):
+            raise RuntimeError(
+                f"{example_id}: invalid fold {fold}"
+            )
+
+        if example_id in lookup:
+            raise RuntimeError(
+                f"Duplicate example_id {example_id}"
+            )
+
+        lookup[example_id] = fold
+        source_ids.add(source_id)
+
+        key = (split, topic)
+        topic_counts[key] = topic_counts.get(key, 0) + 1
+
+    expected_keys = {
+        (split, topic)
+        for split in ("benign", "harmful")
+        for topic in range(100)
+    }
+
+    if set(topic_counts) != expected_keys:
+        raise RuntimeError(
+            f"{model_name}: missing or unexpected source topics"
+        )
+
+    if any(count != 16 for count in topic_counts.values()):
+        raise RuntimeError(
+            f"{model_name}: expected 16 examples per source prompt"
+        )
+
+    if len(source_ids) != 200 or len(lookup) != 3200:
+        raise RuntimeError(
+            f"{model_name}: expected 200 source prompts "
+            "and 3200 examples"
+        )
+
+    counts = {
+        fold: sum(value == fold for value in lookup.values())
+        for fold in range(1, 6)
+    }
+
+    expected_counts = {fold: 640 for fold in range(1, 6)}
+
+    if counts != expected_counts:
+        raise RuntimeError(
+            f"{model_name}: unexpected fold distribution {counts}"
+        )
+
+    print(
+        f"[folds] model={model_name} "
+        f"topic_field=source_id "
+        f"source_prompts={len(source_ids)} "
+        f"examples={len(lookup)} "
+        f"counts={counts}",
+        flush=True,
+    )
+
+    return lookup, "source_id"
+
+
+def direction_file(model_name, fold):
+    component = MODEL_COMPONENTS[model_name]
+
+    return (
+        ROOT
+        / "results/INITIAL_BENCHMARK"
+        / model_name
+        / "wk3/paired_harm_svd"
+        / "text"
+        / component
+        / f"fold_{fold}_directions.npz"
+    )
+
+
+def load_fold_directions(svd, model_name):
+    output = {}
+
+    for fold in range(1, 6):
+        path = direction_file(model_name, fold)
+
+        if not path.is_file():
+            raise FileNotFoundError(path)
+
+        with np.load(path, allow_pickle=False) as saved:
+            means = torch.from_numpy(saved["means"].copy())
+            vectors = torch.from_numpy(saved["vectors"].copy())
+            boundaries = [
+                int(x) for x in saved["layer_boundaries"]
+            ]
+
+        layer = EXPERIMENT["layer_boundary"]
+
+        if boundaries.count(layer) != 1:
+            raise RuntimeError(
+                f"{path}: boundary {layer} missing or duplicated"
+            )
+
+        position = boundaries.index(layer)
+
+        direction = svd.direction(
+            means[position],
+            vectors[position],
+            EXPERIMENT["direction_method"],
+        )
+
+        direction = direction.detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        ).contiguous()
+
+        mean_difference = means[position].detach().to(
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+        if direction.ndim != 1:
+            raise RuntimeError(f"{path}: direction is not rank 1")
+
+        if not bool(torch.isfinite(direction).all()):
+            raise RuntimeError(f"{path}: nonfinite direction")
+
+        norm = direction.norm().item()
+
+        if not math.isclose(norm, 1.0, abs_tol=1e-4):
+            raise RuntimeError(
+                f"{path}: expected unit direction, norm={norm}"
+            )
+
+        gap = torch.dot(mean_difference, direction).item()
+
+        if not math.isfinite(gap) or gap <= 0:
+            raise RuntimeError(
+                f"{path}: invalid projected training gap {gap}"
+            )
+
+        output[fold] = {
+            "direction": direction,
+            "gap": gap,
+            "path": path,
+        }
+
+        print(
+            f"[direction] model={model_name} "
+            f"fold={fold} "
+            f"dim={direction.numel()} "
+            f"norm={norm:.6f} "
+            f"training_gap={gap:.6f}",
+            flush=True,
+        )
+
+    return output
+
+
+class PrefillSteering:
+    def __init__(self, direction, coefficient):
+        self.direction = direction
+        self.coefficient = float(coefficient)
+
+        self.calls = 0
+        self.edits = 0
+        self.sequence_length = None
+        self.hidden_dimension = None
+
+    def __call__(self, module, inputs, output):
+        self.calls += 1
+
+        if self.edits:
+            return output
+
+        if torch.is_tensor(output):
+            hidden = output
+            output_kind = "tensor"
+
+        elif isinstance(output, tuple):
+            if not output or not torch.is_tensor(output[0]):
+                raise RuntimeError(
+                    "Decoder output tuple has no leading tensor"
+                )
+
+            hidden = output[0]
+            output_kind = "tuple"
+
+        elif isinstance(output, list):
+            if not output or not torch.is_tensor(output[0]):
+                raise RuntimeError(
+                    "Decoder output list has no leading tensor"
+                )
+
+            hidden = output[0]
+            output_kind = "list"
+
+        else:
+            raise RuntimeError(
+                "Unsupported decoder output type: "
+                f"{type(output).__name__}"
+            )
+
+        if hidden.ndim != 3:
+            raise RuntimeError(
+                f"Expected rank-3 decoder output, got "
+                f"{tuple(hidden.shape)}"
+            )
+
+        if hidden.shape[-1] != self.direction.numel():
+            raise RuntimeError(
+                f"Direction dimension {self.direction.numel()} "
+                f"does not match hidden dimension {hidden.shape[-1]}"
+            )
+
+        if hidden.shape[0] == 1:
+            sequence_axis = 1
+            sequence_length = hidden.shape[1]
+        elif hidden.shape[1] == 1:
+            sequence_axis = 0
+            sequence_length = hidden.shape[0]
+        else:
+            raise RuntimeError(
+                "Cannot identify the batch dimension for "
+                f"single-example generation: {tuple(hidden.shape)}"
+            )
+
+        if sequence_length <= 1:
+            raise RuntimeError(
+                "The first observed decoder call has sequence "
+                f"length {sequence_length}. Cannot establish "
+                "that this is the full prompt prefill. "
+                "No steering output should be trusted."
+            )
+
+        if not bool(torch.isfinite(hidden).all()):
+            raise RuntimeError("Nonfinite decoder activation")
+
+        shift = (
+            self.direction.to(
+                device=hidden.device,
+                dtype=hidden.dtype,
+            )
+            * self.coefficient
+        )
+
+        if not bool(torch.isfinite(shift).all()):
+            raise RuntimeError("Nonfinite intervention")
+
+        modified = hidden.clone()
+
+        if sequence_axis == 1:
+            modified[:, -1, :] += shift
+        else:
+            modified[-1, :, :] += shift
+
+        if not bool(torch.isfinite(modified).all()):
+            raise RuntimeError("Nonfinite steered activation")
+
+        self.edits += 1
+        self.sequence_length = sequence_length
+        self.hidden_dimension = hidden.shape[-1]
+
+        if output_kind == "tensor":
+            return modified
+
+        if output_kind == "tuple":
+            return (modified,) + output[1:]
+
+        return [modified] + output[1:]
+
+
+
+class Qwen2BatchSteering:
+    def __init__(self, directions, coefficients):
+        self.directions = torch.stack(directions)
+        self.coefficients = torch.tensor(coefficients, dtype=torch.float32)
+        self.mask = None
+        self.calls = 0
+        self.edits = 0
+        self.sequence_length = None
+        self.hidden_dimension = None
+
+    def __call__(self, module, inputs, output):
+        self.calls += 1
+        if self.edits:
+            return output
+
+        if torch.is_tensor(output):
+            hidden, kind = output, "tensor"
+        elif isinstance(output, (tuple, list)) and output and torch.is_tensor(output[0]):
+            hidden = output[0]
+            kind = "tuple" if isinstance(output, tuple) else "list"
+        else:
+            raise RuntimeError("Unexpected Qwen2 decoder output")
+
+        mask = self.mask
+        n = self.directions.shape[0]
+
+        if mask is None or mask.ndim != 2 or mask.shape[0] != n:
+            raise RuntimeError("Missing batch attention mask")
+
+        if hidden.ndim != 3 or hidden.shape[:2] != mask.shape:
+            raise RuntimeError(
+                f"Qwen2 decoder shape {tuple(hidden.shape)} "
+                f"does not match mask {tuple(mask.shape)}"
+            )
+
+        if hidden.shape[-1] != self.directions.shape[-1]:
+            raise RuntimeError("Direction dimension mismatch")
+
+        if hidden.shape[1] <= 1:
+            raise RuntimeError("Expected full prompt prefill")
+
+        if not torch.all(mask[:, -1] == 1).item():
+            raise RuntimeError(
+                "Batch contains right-padded prompts: final sequence "
+                "position would not correspond to the last real token"
+            )
+
+        if not bool(torch.isfinite(hidden).all()):
+            raise RuntimeError("Nonfinite decoder activations")
+
+        shifts = self.directions.to(
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+
+        coeff = self.coefficients.to(
+            device=hidden.device,
+            dtype=hidden.dtype,
+        )
+
+        shifts = shifts * coeff[:, None]
+
+        if not bool(torch.isfinite(shifts).all()):
+            raise RuntimeError("Nonfinite steering shifts")
+
+        modified = hidden.clone()
+        modified[:, -1, :] += shifts
+
+        if not bool(torch.isfinite(modified).all()):
+            raise RuntimeError("Nonfinite modified activations")
+
+        self.edits = 1
+        self.sequence_length = hidden.shape[1]
+        self.hidden_dimension = hidden.shape[-1]
+
+        if kind == "tensor":
+            return modified
+
+        if kind == "tuple":
+            return (modified,) + output[1:]
+
+        return [modified] + output[1:]
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--model",
+        required=True,
+        choices=tuple(MODEL_COMPONENTS),
+    )
+
+    parser.add_argument(
+        "--modality",
+        default="both",
+        choices=("text", "audio", "both"),
+    )
+
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=DEFAULT_STRENGTH,
+    )
+
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+    )
+
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--selection",
+        choices=("default", "unsafe_audio10", "benign_audio10", "balanced10", "qwen2_adjudicated16"),
+        default="default",
+    )
+    parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--merge-only", action="store_true")
+    parser.add_argument("--test-boundary", type=int, default=None)
+    parser.add_argument("--full-run", action="store_true")
+
+    return parser
+
+
+
+def select_original_unsafe_audio(model_name, manifest):
+    judged_files = {
+        "qwen2_audio": (
+            "qwen2_audio.audio.harmful.adjudicated.carefully_rechecked.jsonl"
+        ),
+        "kimi_audio": (
+            "kimi_audio.audio.harmful.adjudicated.carefully_rechecked.jsonl"
+        ),
+        "qwen25_omni": (
+            "qwen25_omni.audio.harmful.readjudicated.carefully_rechecked.jsonl"
+        ),
+    }
+
+    path = (
+        ROOT
+        / "results/INITIAL_BENCHMARK/all_judged"
+        / judged_files[model_name]
+    )
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    unsafe_ids = set()
+
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            record = json.loads(line)
+
+            if record["split"] != "harmful":
+                raise RuntimeError(f"Unexpected split in {path}")
+
+            decision = record["decision"]
+
+            if isinstance(decision, bool) or decision not in (0, 1):
+                raise RuntimeError(
+                    f"Invalid adjudication decision: {decision!r}"
+                )
+
+            if decision == 1:
+                task_id = record["task_id"]
+
+                if not task_id.endswith("__audio"):
+                    raise RuntimeError(
+                        f"Unexpected audio task_id: {task_id}"
+                    )
+
+                if task_id in unsafe_ids:
+                    raise RuntimeError(
+                        f"Duplicate unsafe task_id: {task_id}"
+                    )
+
+                unsafe_ids.add(task_id)
+
+    selected = []
+    seen_sources = set()
+
+    for row in manifest:
+        if row["split"] != "harmful":
+            continue
+
+        task_id = row["example_id"] + "__audio"
+
+        if task_id not in unsafe_ids:
+            continue
+
+        source_id = row["source_id"]
+
+        if source_id in seen_sources:
+            continue
+
+        seen_sources.add(source_id)
+        selected.append(row)
+
+        if len(selected) == 10:
+            break
+
+    if len(selected) != 10:
+        raise RuntimeError(
+            f"{model_name}: only {len(selected)} distinct source "
+            "prompts with adjudicated unsafe audio responses"
+        )
+
+    print(
+        f"[selection] model={model_name} "
+        f"unsafe_audio_tasks={len(unsafe_ids)} "
+        f"selected_sources=10",
+        flush=True,
+    )
+
+    for index, row in enumerate(selected, 1):
+        print(
+            f"[selection] {index:02d} "
+            f"{row['example_id']} "
+            f"source={row['source_id']}",
+            flush=True,
+        )
+
+    return selected
+
+
+
+def select_original_benign_audio(model_name, manifest):
+    judged_files = {
+        "qwen2_audio": (
+            "qwen2_audio.audio.benign.adjudicated.carefully_rechecked.jsonl"
+        ),
+        "qwen25_omni": (
+            "qwen25_omni.audio.benign.readjudicated.carefully_rechecked.jsonl"
+        ),
+    }
+
+    if model_name not in judged_files:
+        raise ValueError(
+            "benign_audio10 is supported only for the two Qwen models"
+        )
+
+    path = (
+        ROOT / "results/INITIAL_BENCHMARK/all_judged"
+        / judged_files[model_name]
+    )
+
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    answered_ids = set()
+    seen_ids = set()
+
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+
+            record = json.loads(line)
+
+            if record["split"] != "benign":
+                raise RuntimeError(f"Unexpected split in {path}")
+
+            decision = record["decision"]
+            if isinstance(decision, bool) or decision not in (0, 1):
+                raise RuntimeError(f"Invalid decision: {decision!r}")
+
+            task_id = record["task_id"]
+
+            if not task_id.endswith("__audio"):
+                raise RuntimeError(f"Unexpected task_id: {task_id}")
+
+            if task_id in seen_ids:
+                raise RuntimeError(f"Duplicate judged task: {task_id}")
+
+            seen_ids.add(task_id)
+
+            if decision == 0:
+                answered_ids.add(task_id)
+
+    selected = []
+    seen_sources = set()
+
+    for row in manifest:
+        if row["split"] != "benign":
+            continue
+
+        task_id = row["example_id"] + "__audio"
+        if task_id not in answered_ids:
+            continue
+
+        source_id = row["source_id"]
+        if source_id in seen_sources:
+            continue
+
+        seen_sources.add(source_id)
+        selected.append(row)
+
+        if len(selected) == 10:
+            break
+
+    if len(selected) != 10:
+        raise RuntimeError(
+            f"{model_name}: only {len(selected)} distinct benign "
+            "sources with originally non-refused audio responses"
+        )
+
+    print(
+        f"[selection] model={model_name} "
+        f"original_audio_nonrefusals={len(answered_ids)} "
+        "selected_sources=10",
+        flush=True,
+    )
+
+    for index, row in enumerate(selected, 1):
+        print(
+            f"[selection] {index:02d} {row['example_id']} "
+            f"source={row['source_id']}",
+            flush=True,
+        )
+
+    return selected
+
+
+def main():
+    args = build_parser().parse_args()
+    if args.model != "kimi_audio":
+        raise ValueError("This script is restricted to kimi_audio")
+
+    if args.test_boundary is not None:
+        if args.full_run:
+            if args.selection != "default":
+                raise ValueError(
+                    "Full-run boundary override requires default selection"
+                )
+        elif args.selection not in ("unsafe_audio10", "benign_audio10", "balanced10", "qwen2_adjudicated16"):
+            raise ValueError(
+                "--test-boundary requires a 10-example test selection"
+            )
+        if not 1 <= args.test_boundary <= DECODER_DEPTHS[args.model]:
+            raise ValueError("Invalid test boundary")
+
+        EXPERIMENT["layer_boundary"] = args.test_boundary
+        EXPERIMENT["block_index"] = args.test_boundary - 1
+        EXPERIMENT["name"] = (
+            f"layer{args.test_boundary}_text_svd1_prefill_last"
+        )
+
+    if not math.isfinite(args.strength):
+        raise ValueError("Strength must be finite")
+
+    if args.full_run and (
+        args.selection != "default"
+        or args.limit is not None
+        or args.modality != "both"
+    ):
+        raise ValueError(
+            "--full-run requires --selection default, "
+            "--modality both, and no --limit"
+        )
+
+    if args.selection != "default" and args.limit is not None:
+        raise ValueError(
+            "--selection unsafe_audio10 cannot be combined with --limit"
+        )
+
+    if args.num_shards < 1:
+        raise ValueError("num-shards must be positive")
+
+    if args.shard_index is not None:
+        if not 0 <= args.shard_index < args.num_shards:
+            raise ValueError("Invalid shard-index")
+
+    generator = import_module(
+        "clean_benchmark_original_generator",
+        GENERATOR,
+    )
+
+    svd = import_module(
+        "wk3_paired_harm_svd",
+        SVD_SCRIPT,
+    )
+
+    manifest = read_manifest(generator)
+
+    if args.selection in ("unsafe_audio10", "benign_audio10", "balanced10", "qwen2_adjudicated16"):
+        if args.selection == "unsafe_audio10":
+            selected_manifest = select_original_unsafe_audio(
+                args.model,
+                manifest,
+            )
+        elif args.selection == "benign_audio10":
+            selected_manifest = select_original_benign_audio(
+                args.model,
+                manifest,
+            )
+        elif args.selection == "qwen2_adjudicated16":
+            if args.model != "qwen2_audio":
+                raise ValueError("qwen2_adjudicated16 requires qwen2_audio")
+
+            benign = select_original_benign_audio(args.model, manifest)[:8]
+            harmful = select_original_unsafe_audio(args.model, manifest)[:8]
+            selected_manifest = benign + harmful
+
+            if len(selected_manifest) != 16:
+                raise RuntimeError("Expected 8 benign and 8 harmful examples")
+
+            for row in selected_manifest:
+                print(
+                    f"[qwen2_adjudicated16] {row['split']} {row['example_id']}",
+                    flush=True,
+                )
+
+        else:
+            benign = [r for r in manifest if r["split"] == "benign"][:5]
+            harmful = [r for r in manifest if r["split"] == "harmful"][:5]
+
+            if len(benign) != 5 or len(harmful) != 5:
+                raise RuntimeError("Cannot select 5 benign and 5 harmful")
+
+            selected_manifest = benign + harmful
+
+            for row in selected_manifest:
+                print(
+                    f"[balanced10] {row['split']} {row['example_id']}",
+                    flush=True,
+                )
+
+        def load_selected_examples():
+            return list(selected_manifest)
+
+        generator.load_examples = load_selected_examples
+
+    folds, topic_field = build_fold_mapping(
+        svd,
+        args.model,
+        manifest,
+    )
+
+    directions = load_fold_directions(
+        svd,
+        args.model,
+    )
+
+    strength_name = f"strength_{args.strength:+.6f}"
+
+    experiment_dir = (
+        OUTPUT_ROOT
+        / args.model
+        / "wk3/steering_layer26_text_svd1"
+    )
+
+    if args.selection in ("unsafe_audio10", "benign_audio10", "balanced10", "qwen2_adjudicated16"):
+        if args.test_boundary is not None:
+            experiment_dir = (
+                OUTPUT_ROOT / args.model / "wk3"
+                / f"steering_layer{args.test_boundary}_text_svd1"
+            )
+
+        experiment_dir = experiment_dir / args.selection
+
+    if args.full_run:
+        if args.test_boundary is not None:
+            experiment_dir = (
+                OUTPUT_ROOT / args.model / "wk3"
+                / f"steering_layer{args.test_boundary}_text_svd1"
+            )
+        experiment_dir = experiment_dir / "full_6400"
+
+    output = experiment_dir / strength_name
+
+    if output.resolve() == (
+        ROOT / "results/audio_jailbreak_clean_benchmark"
+    ).resolve():
+        raise RuntimeError("Refusing to overwrite baseline results")
+
+    if args.model not in MODEL_COMPONENTS:
+        raise RuntimeError(f"Unexpected model: {args.model}")
+
+    if output.resolve() == generator.RESULT_ROOT.resolve():
+        raise RuntimeError("Refusing to use baseline output directory")
+
+    original_result_paths = generator.result_paths
+    original_all_shard_paths = generator.all_shard_paths
+
+    def steering_result_paths(model_name, num_shards, shard_index):
+        if model_name != args.model:
+            raise RuntimeError(
+                f"Output model mismatch: {model_name} != {args.model}"
+            )
+
+        shard_dir = output / "shards"
+        shard = (
+            shard_dir
+            / f"responses.shard{shard_index:03d}-of-{num_shards:03d}.jsonl"
+        )
+        done = (
+            shard_dir
+            / f"shard{shard_index:03d}-of-{num_shards:03d}.done"
+        )
+
+        return output, shard_dir, shard, done
+
+    def steering_all_shard_paths(model_name, num_shards):
+        if model_name != args.model:
+            raise RuntimeError(
+                f"Output model mismatch: {model_name} != {args.model}"
+            )
+
+        shard_dir = output / "shards"
+        shards = [
+            shard_dir
+            / f"responses.shard{i:03d}-of-{num_shards:03d}.jsonl"
+            for i in range(num_shards)
+        ]
+        done = [
+            shard_dir
+            / f"shard{i:03d}-of-{num_shards:03d}.done"
+            for i in range(num_shards)
+        ]
+
+        return output, shards, done
+
+    def steering_output_path(model_name, modality):
+        if model_name != args.model:
+            raise RuntimeError(
+                f"Output model mismatch: {model_name} != {args.model}"
+            )
+
+        if modality not in ("text", "audio"):
+            raise RuntimeError(f"Invalid modality: {modality}")
+
+        return output / f"responses.all.{modality}.jsonl"
+
+    generator.result_paths = steering_result_paths
+    generator.all_shard_paths = steering_all_shard_paths
+    generator.output_path = steering_output_path
+
+    expected_shard_dir = output / "shards"
+
+    check_outdir, check_sharddir, check_shard, check_done = (
+        generator.result_paths(args.model, 1, 0)
+    )
+
+    assert check_outdir == output
+    assert check_sharddir == expected_shard_dir
+    assert check_shard == expected_shard_dir / "responses.shard000-of-001.jsonl"
+    assert check_done == expected_shard_dir / "shard000-of-001.done"
+
+    merge_dir, merge_shards, merge_done = (
+        generator.all_shard_paths(args.model, 1)
+    )
+
+    assert merge_dir == output
+    assert merge_shards == [check_shard]
+    assert merge_done == [check_done]
+
+    for modality in ("text", "audio"):
+        expected = output / f"responses.all.{modality}.jsonl"
+        assert generator.output_path(args.model, modality) == expected
+
+    print(
+        f"[output validation] PASS: shard and merge paths agree: {output}",
+        flush=True,
+    )
+
+    original_loader = generator.load_model
+    original_make_record = generator.make_record
+
+    completed_metadata = {}
+
+    def steered_loader(model_name):
+        model, infer_text, infer_audio = original_loader(model_name)
+
+        module_path, block = resolve_decoder(
+            model,
+            model_name,
+        )
+
+        print(
+            f"[steering] target={module_path} "
+            f"method={EXPERIMENT['direction_method']} "
+            f"strength={args.strength:+.6f}",
+            flush=True,
+        )
+
+        def wrap(original_infer, modality):
+            def run(rows):
+                responses = []
+                batched = None
+                batched_responses = None
+
+                if model_name == "qwen2_audio" and len(rows) > 1:
+                    for row in rows:
+                        if row["example_id"] not in folds:
+                            raise RuntimeError(
+                                f"Missing fold: {row['example_id']}"
+                            )
+
+                    selected = [
+                        directions[folds[row["example_id"]]]
+                        for row in rows
+                    ]
+
+                    batched = Qwen2BatchSteering(
+                        [item["direction"] for item in selected],
+                        [args.strength * item["gap"] for item in selected],
+                    )
+
+                    original_generate = model.generate
+
+                    def capture_generate(*a, **kw):
+                        mask = kw.get("attention_mask")
+                        if mask is None:
+                            raise RuntimeError(
+                                "Qwen2 generate missing attention_mask"
+                            )
+                        batched.mask = mask
+                        return original_generate(*a, **kw)
+
+                    handle = block.register_forward_hook(batched)
+
+                    try:
+                        model.generate = capture_generate
+                        batched_responses = original_infer(rows)
+                    finally:
+                        model.generate = original_generate
+                        handle.remove()
+
+                    if isinstance(batched_responses, str):
+                        batched_responses = [batched_responses]
+
+                    if (
+                        len(batched_responses) != len(rows)
+                        or batched.edits != 1
+                    ):
+                        raise RuntimeError(
+                            "Unexpected Qwen2 batch result/hook count"
+                        )
+
+                    print(
+                        f"[steering batch] n={len(rows)} "
+                        f"folds={[folds[r['example_id']] for r in rows]} "
+                        f"prefill_length={batched.sequence_length}",
+                        flush=True,
+                    )
+
+                for row_index, row in enumerate(rows):
+                    example_id = row["example_id"]
+
+                    if example_id not in folds:
+                        raise RuntimeError(
+                            f"Missing fold assignment: {example_id}"
+                        )
+
+                    fold = folds[example_id]
+                    data = directions[fold]
+
+                    coefficient = args.strength * data["gap"]
+
+                    if batched is not None:
+                        intervention = batched
+                        produced = [batched_responses[row_index]]
+                    else:
+                        intervention = PrefillSteering(
+                            direction=data["direction"],
+                            coefficient=coefficient,
+                        )
+
+                        handle = block.register_forward_hook(intervention)
+                        try:
+                            produced = original_infer([row])
+                        finally:
+                            handle.remove()
+
+                    if intervention.edits != 1:
+                        raise RuntimeError(
+                            f"{example_id}: expected one intervention; "
+                            f"got {intervention.edits}"
+                        )
+
+                    if isinstance(produced, str):
+                        produced = [produced]
+
+                    if len(produced) != 1:
+                        raise RuntimeError(
+                            f"{example_id}: expected one response, "
+                            f"got {len(produced)}"
+                        )
+
+                    task_id = example_id + "__" + modality
+
+                    if task_id in completed_metadata:
+                        raise RuntimeError(
+                            f"Repeated generation task: {task_id}"
+                        )
+
+                    completed_metadata[task_id] = {
+                        "experiment": EXPERIMENT["name"],
+                        "layer_boundary":
+                            EXPERIMENT["layer_boundary"],
+                        "block_index":
+                            EXPERIMENT["block_index"],
+                        "module": module_path,
+                        "direction_source":
+                            EXPERIMENT["direction_source"],
+                        "direction_method":
+                            EXPERIMENT["direction_method"],
+                        "fold": fold,
+                        "topic_field": topic_field,
+                        "topic_id": str(row[topic_field]),
+                        "strength": args.strength,
+                        "training_harmful_benign_gap":
+                            data["gap"],
+                        "injected_coefficient": coefficient,
+                        "direction_file": str(
+                            data["path"].relative_to(ROOT)
+                        ),
+                        "position":
+                            EXPERIMENT["injection_position"],
+                        "phase":
+                            EXPERIMENT["injection_phase"],
+                        "hook_calls": intervention.calls,
+                        "hook_edits": intervention.edits,
+                        "prefill_sequence_length":
+                            intervention.sequence_length,
+                        "hidden_dimension":
+                            intervention.hidden_dimension,
+                    }
+
+                    responses.append(produced[0])
+
+                    print(
+                        f"[steered] {model_name} "
+                        f"{task_id} "
+                        f"fold={fold} "
+                        f"strength={args.strength:+.4f} "
+                        f"coefficient={coefficient:+.4f} "
+                        f"prefill_length={intervention.sequence_length} "
+                        f"hook_calls={intervention.calls}",
+                        flush=True,
+                    )
+
+                return responses
+
+            return run
+
+        return (
+            model,
+            wrap(infer_text, "text"),
+            wrap(infer_audio, "audio"),
+        )
+
+    def steered_record(model_name, modality, row, response):
+        record = original_make_record(
+            model_name=model_name,
+            modality=modality,
+            row=row,
+            response=response,
+        )
+
+        task_id = record["task_id"]
+
+        if task_id not in completed_metadata:
+            raise RuntimeError(
+                f"Missing steering metadata: {task_id}"
+            )
+
+        record["steering"] = completed_metadata.pop(task_id)
+
+        return record
+
+    generator.load_model = steered_loader
+    generator.make_record = steered_record
+
+    generator_argv = [
+        str(GENERATOR),
+        "--model", args.model,
+        "--modality", args.modality,
+        "--batch-size", "16" if args.model == "qwen2_audio" else "1",
+        "--num-shards", str(args.num_shards),
+    ]
+
+    if args.shard_index is not None:
+        generator_argv.extend([
+            "--shard-index",
+            str(args.shard_index),
+        ])
+
+    if args.limit is not None:
+        generator_argv.extend([
+            "--limit",
+            str(args.limit),
+        ])
+
+    if args.preflight:
+        generator_argv.append("--preflight")
+
+    if args.merge_only:
+        generator_argv.append("--merge-only")
+
+    print("=" * 90)
+    print(
+        f"LAYER-{EXPERIMENT['layer_boundary']} "
+        "TEXT-TRAINED SVD-1 GENERATION"
+    )
+    print("=" * 90)
+    print("Model:", args.model)
+    print("Modality:", args.modality)
+    print("Original generator:", GENERATOR)
+    print("Original benchmark:", generator.MANIFEST)
+    print("Output:", output)
+    print("Direction:", EXPERIMENT["direction_source"])
+    print("Method:", EXPERIMENT["direction_method"])
+    print("Boundary:", EXPERIMENT["layer_boundary"])
+    print("Strength:", args.strength)
+    print("Position:", EXPERIMENT["injection_position"])
+    print("Phase:", EXPERIMENT["injection_phase"])
+    print("Batch size:", 16 if args.model == "qwen2_audio" else 1)
+    print("Baseline outputs: unchanged")
+    print("=" * 90, flush=True)
+
+    if args.full_run and not args.preflight:
+        output.mkdir(parents=True, exist_ok=True)
+
+        def sha256_file(path):
+            digest = hashlib.sha256()
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        config = {
+            "model": args.model,
+            "modality": args.modality,
+            "strength": args.strength,
+            "selection": args.selection,
+            "examples": len(manifest),
+            "generations": len(manifest) * 2,
+            "num_shards": args.num_shards,
+            "layer_boundary": EXPERIMENT["layer_boundary"],
+            "direction_source": EXPERIMENT["direction_source"],
+            "direction_method": EXPERIMENT["direction_method"],
+            "manifest_sha256": sha256_file(generator.MANIFEST),
+            "generator_sha256": sha256_file(GENERATOR),
+            "steering_script_sha256": sha256_file(Path(__file__)),
+            "direction_sha256": {
+                str(fold): sha256_file(direction_file(args.model, fold))
+                for fold in range(1, 6)
+            },
+        }
+
+        if config["examples"] != 3200:
+            raise RuntimeError("Full run must contain 3200 examples")
+
+        config_path = output / "run_config.json"
+        config_lock = output / ".run_config.lock"
+
+        with config_lock.open("a+") as lock:
+            pass
+            try:
+                if config_path.exists():
+                    saved = json.loads(config_path.read_text())
+
+                    if saved != config:
+                        raise RuntimeError(
+                            "Existing full-run configuration differs. "
+                            "Refusing to mix incompatible results."
+                        )
+
+                    print("[resume] Configuration verified", flush=True)
+                else:
+                    temporary = output / (
+                        f".run_config.{os.getpid()}.tmp"
+                    )
+                    try:
+                        temporary.write_text(
+                            json.dumps(config, indent=2, sort_keys=True) + "\n"
+                        )
+                        os.replace(temporary, config_path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+
+                    print("[resume] Configuration created", flush=True)
+            finally:
+                pass
+
+        if not args.merge_only:
+            shard_index = (
+                args.shard_index
+                if args.shard_index is not None
+                else 0
+            )
+
+            _, _, shard_path, _ = generator.result_paths(
+                args.model, args.num_shards, shard_index
+            )
+
+            if shard_path.exists():
+                with shard_path.open(encoding="utf-8") as f:
+                    for line_number, line in enumerate(f, 1):
+                        record = json.loads(line)
+                        steering = record.get("steering")
+
+                        if not isinstance(steering, dict):
+                            raise RuntimeError(
+                                f"{shard_path}:{line_number}: "
+                                "missing steering metadata"
+                            )
+
+                        if (
+                            steering.get("strength") != args.strength
+                            or steering.get("experiment") != EXPERIMENT["name"]
+                            or steering.get("direction_source") != "text"
+                            or steering.get("direction_method") != "svd_1"
+                            or steering.get("layer_boundary") != EXPERIMENT["layer_boundary"]
+                            or steering.get("hook_edits") != 1
+                        ):
+                            raise RuntimeError(
+                                f"{shard_path}:{line_number}: "
+                                "incompatible completed generation"
+                            )
+
+            shard_lock = (
+                output / "shards"
+                / f".shard{shard_index:03d}-of-{args.num_shards:03d}.lock"
+            )
+            shard_lock.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            shard_lock = output / ".merge.lock"
+
+    else:
+        shard_lock = None
+
+    old_argv = sys.argv
+
+    try:
+        sys.argv = generator_argv
+
+        if shard_lock is None:
+            generator.main()
+        else:
+            with shard_lock.open("a+") as lock:
+                pass
+                try:
+                    generator.main()
+                finally:
+                    pass
+    finally:
+        sys.argv = old_argv
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+
+import csv
+import json
+import shutil
+from collections import Counter, defaultdict
+from pathlib import Path
+
+
+ROOT = Path("/research/milsrg1/user_workspace/am3244/safety-alignment")
+RESULTS = ROOT / "results/INITIAL_BENCHMARK"
+INPUT = RESULTS / "all_judged"
+FOLD_SOURCE = RESULTS / "qwen2_audio/5fold"
+
+MODELS = (
+    "qwen2_audio",
+    "qwen25_omni",
+    "kimi_audio",
+    "audio_flamingo3",
+)
+
+MODALITIES = ("text", "audio")
+SPLITS = ("benign", "harmful")
+FOLDS = (1, 2, 3, 4, 5)
+
+LANGUAGES = ("english", "chinese", "russian", "spanish")
+CONDITIONS = (
+    "original",
+    "literal",
+    "narrative_framing",
+    "content_dilution",
+)
+
+EXPECTED_BASES_PER_SPLIT = 100
+EXPECTED_VARIANTS_PER_BASE = 32
+
+
+def read_jsonl(path):
+    with path.open(encoding="utf-8") as f:
+        for number, line in enumerate(f, 1):
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"{path}:{number}: invalid JSON"
+                ) from exc
+
+
+def read_task_id(task_id):
+    parts = task_id.split("__")
+
+    if len(parts) != 4:
+        raise ValueError(f"Invalid task_id: {task_id}")
+
+    base_id, condition, language, modality = parts
+
+    if not base_id.startswith(("jbb_benign_", "jbb_harmful_")):
+        raise ValueError(f"Invalid base prompt: {task_id}")
+
+    if condition not in CONDITIONS:
+        raise ValueError(f"Unknown condition: {task_id}")
+
+    if language not in LANGUAGES:
+        raise ValueError(f"Unknown language: {task_id}")
+
+    if modality not in MODALITIES:
+        raise ValueError(f"Unknown modality: {task_id}")
+
+    split = base_id.split("_")[1]
+
+    return base_id, split, condition, language, modality
+
+
+def write_csv(path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def percentage(n, total):
+    if total == 0:
+        return "N/A"
+    return f"{100 * n / total:.2f}%"
+
+
+def checked_filename(model, modality, split):
+    suffix = (
+        "readjudicated.carefully_rechecked.jsonl"
+        if model == "qwen25_omni"
+        else "adjudicated.carefully_rechecked.jsonl"
+    )
+
+    return f"{model}.{modality}.{split}.{suffix}"
+
+
+def load_judgments(model):
+    records = []
+    missing = []
+
+    for modality in MODALITIES:
+        for split in SPLITS:
+            path = INPUT / checked_filename(model, modality, split)
+
+            if not path.is_file():
+                missing.append(path.name)
+                continue
+
+            for obj in read_jsonl(path):
+                task_id = obj["task_id"]
+                base_id, parsed_split, condition, language, parsed_modality = (
+                    read_task_id(task_id)
+                )
+
+                if parsed_split != split or obj["split"] != split:
+                    raise ValueError(f"Split mismatch: {task_id}")
+
+                if parsed_modality != modality:
+                    raise ValueError(f"Modality mismatch: {task_id}")
+
+                if obj["condition"] != condition:
+                    raise ValueError(f"Condition mismatch: {task_id}")
+
+                if obj["language"] != language:
+                    raise ValueError(f"Language mismatch: {task_id}")
+
+                decision = obj["decision"]
+
+                if type(decision) is not int or decision not in (0, 1):
+                    raise ValueError(f"Invalid decision: {task_id}")
+
+                records.append({
+                    "task_id": task_id,
+                    "base_id": base_id,
+                    "split": split,
+                    "modality": modality,
+                    "language": language,
+                    "condition": condition,
+                    "decision": decision,
+                })
+
+    ids = [row["task_id"] for row in records]
+
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"{model}: duplicate task IDs")
+
+    return records, missing
+
+
+def load_existing_folds():
+    import random
+
+    seed = 42
+
+    # The original first-fold manifest is used only to establish the
+    # authoritative task inventory, never to reuse its old partitions.
+    source_path = FOLD_SOURCE / "fold_1.jsonl"
+
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+
+    canonical_ids = set()
+    base_variants = Counter()
+
+    for obj in read_jsonl(source_path):
+        task_id = obj["task_id"]
+        base_id, split, condition, language, modality = (
+            read_task_id(task_id)
+        )
+
+        if task_id in canonical_ids:
+            raise ValueError(f"Duplicate task_id: {task_id}")
+
+        canonical_ids.add(task_id)
+        base_variants[base_id] += 1
+
+    if len(canonical_ids) != 6400:
+        raise ValueError(
+            f"Expected 6400 task IDs; found {len(canonical_ids)}"
+        )
+
+    if len(base_variants) != 200:
+        raise ValueError(
+            f"Expected 200 base prompts; found {len(base_variants)}"
+        )
+
+    for base_id, count in base_variants.items():
+        if count != EXPECTED_VARIANTS_PER_BASE:
+            raise ValueError(
+                f"{base_id}: expected 32 variants, found {count}"
+            )
+
+    indices = list(range(100))
+    random.Random(seed).shuffle(indices)
+
+    index_folds = {
+        index: position // 20 + 1
+        for position, index in enumerate(indices)
+    }
+
+    base_folds = {}
+
+    for index in range(100):
+        for split in SPLITS:
+            base_id = f"jbb_{split}_{index:03d}"
+
+            if base_id not in base_variants:
+                raise ValueError(
+                    f"Missing topic-paired base prompt: {base_id}"
+                )
+
+            base_folds[base_id] = index_folds[index]
+
+    manifests = {}
+
+    for fold in FOLDS:
+        assignments = {}
+
+        for task_id in canonical_ids:
+            base_id = read_task_id(task_id)[0]
+            assignments[task_id] = (
+                "test" if base_folds[base_id] == fold
+                else "train"
+            )
+
+        test_ids = [
+            task_id
+            for task_id, partition in assignments.items()
+            if partition == "test"
+        ]
+
+        test_counts = Counter(
+            read_task_id(task_id)[1]
+            for task_id in test_ids
+        )
+
+        if len(test_ids) != 1280:
+            raise ValueError(
+                f"Fold {fold}: expected 1280 test rows, "
+                f"found {len(test_ids)}"
+            )
+
+        if test_counts != {
+            "benign": 640,
+            "harmful": 640,
+        }:
+            raise ValueError(
+                f"Fold {fold}: invalid class composition "
+                f"{test_counts}"
+            )
+
+        manifests[fold] = assignments
+
+    for index in range(100):
+        benign = f"jbb_benign_{index:03d}"
+        harmful = f"jbb_harmful_{index:03d}"
+
+        if base_folds[benign] != base_folds[harmful]:
+            raise ValueError(
+                f"Topic-pair leakage at index {index:03d}"
+            )
+
+    print("\\n===== TOPIC-PAIRED FIVE-FOLD VALIDATION =====")
+    print(f"Seed: {seed}")
+    print(f"Original task inventory: {source_path}")
+    print(f"Unique task IDs: {len(canonical_ids)}")
+    print(f"Unique base prompts: {len(base_folds)}")
+    print("Benign/harmful topic pairs grouped: PASS")
+    print("All languages, conditions, modalities grouped: PASS")
+    print("Each topic index tested exactly once: PASS")
+
+    for fold in FOLDS:
+        test_indices = sorted(
+            index
+            for index, assigned_fold in index_folds.items()
+            if assigned_fold == fold
+        )
+
+        print(
+            f"Fold {fold}: train=5120 test=1280 "
+            f"topic_pairs_train=80 topic_pairs_test=20"
+        )
+        print(
+            f"  Test topic indices: "
+            f"{','.join(f'{i:03d}' for i in test_indices)}"
+        )
+
+    return canonical_ids, base_folds, manifests
+
+
+def summarize(rows, dimensions):
+    groups = defaultdict(list)
+
+    for row in rows:
+        key = tuple(row[field] for field in dimensions)
+        groups[key].append(row)
+
+    output = []
+
+    for key, group in sorted(groups.items()):
+        n = len(group)
+        positive = sum(row["decision"] for row in group)
+
+        split = next(
+            (
+                value for value in key
+                if value in SPLITS
+            ),
+            None,
+        )
+
+        metric = (
+            "ASR" if split == "harmful"
+            else "BRR" if split == "benign"
+            else "decision_1"
+        )
+
+        output.append({
+            "key": key,
+            "n": n,
+            "positive": positive,
+            "negative": n - positive,
+            "rate": 100 * positive / n if n else None,
+            "metric": metric,
+        })
+
+    return output
+
+
+def comparison_section(rows, title, dimensions):
+    lines = [
+        "",
+        "=" * 115,
+        title,
+        "=" * 115,
+        f"{'Group':56s} {'Metric':6s} "
+        f"{'Text N':>8s} {'Audio N':>8s} "
+        f"{'Text %':>10s} {'Audio %':>10s} {'Delta pp':>10s}",
+        "-" * 115,
+    ]
+
+    groups = defaultdict(list)
+
+    for row in rows:
+        key = (
+            tuple(row[field] for field in dimensions),
+            row["split"],
+            row["modality"],
+        )
+        groups[key].append(row)
+
+    labels = sorted({
+        tuple(row[field] for field in dimensions)
+        for row in rows
+    })
+
+    for label in labels:
+        for split in ("harmful", "benign"):
+            text_rows = groups[label, split, "text"]
+            audio_rows = groups[label, split, "audio"]
+
+            if not text_rows and not audio_rows:
+                continue
+
+            nt = len(text_rows)
+            na = len(audio_rows)
+
+            rt = (
+                100 * sum(row["decision"] for row in text_rows) / nt
+                if nt else None
+            )
+            ra = (
+                100 * sum(row["decision"] for row in audio_rows) / na
+                if na else None
+            )
+
+            text_rate = f"{rt:.2f}%" if rt is not None else "N/A"
+            audio_rate = f"{ra:.2f}%" if ra is not None else "N/A"
+            delta = (
+                f"{ra - rt:+.2f}"
+                if rt is not None and ra is not None else "N/A"
+            )
+
+            name = " | ".join(label) if label else "all"
+            metric = "ASR" if split == "harmful" else "BRR"
+
+            lines.append(
+                f"{name[:56]:56s} {metric:6s} "
+                f"{nt:8d} {na:8d} "
+                f"{text_rate:>10s} {audio_rate:>10s} "
+                f"{delta:>10s}"
+            )
+
+    return lines
+
+
+def paired_examples(rows):
+    grouped = defaultdict(dict)
+
+    for row in rows:
+        key = (
+            row["base_id"],
+            row["split"],
+            row["language"],
+            row["condition"],
+        )
+        grouped[key][row["modality"]] = row["decision"]
+
+    output = []
+
+    for key, decisions in sorted(grouped.items()):
+        text = decisions.get("text")
+        audio = decisions.get("audio")
+
+        transition = (
+            f"{text}->{audio}"
+            if text is not None and audio is not None
+            else "unmatched"
+        )
+
+        output.append({
+            "base_id": key[0],
+            "split": key[1],
+            "language": key[2],
+            "condition": key[3],
+            "text_decision": text if text is not None else "",
+            "audio_decision": audio if audio is not None else "",
+            "transition": transition,
+        })
+
+    return output
+
+
+def transition_section(pairs):
+    lines = [
+        "",
+        "=" * 115,
+        "PAIRED TEXT -> AUDIO DECISION TRANSITIONS",
+        "=" * 115,
+        "",
+        "Harmful: 0->1 means audio introduces harmful compliance.",
+        "Benign:  0->1 means audio introduces inappropriate refusal.",
+        "",
+    ]
+
+    for dimensions in (
+        ("split",),
+        ("split", "language"),
+        ("split", "condition"),
+        ("split", "language", "condition"),
+    ):
+        groups = defaultdict(Counter)
+
+        for row in pairs:
+            key = tuple(row[field] for field in dimensions)
+            groups[key][row["transition"]] += 1
+
+        lines.append("")
+        lines.append("GROUPING: " + " x ".join(dimensions))
+
+        for key, counts in sorted(groups.items()):
+            matched = sum(
+                counts[t]
+                for t in ("0->0", "0->1", "1->0", "1->1")
+            )
+
+            parts = [
+                f"{t}={counts[t]} ({percentage(counts[t], matched)})"
+                for t in ("0->0", "0->1", "1->0", "1->1")
+            ]
+
+            lines.append(
+                " | ".join(key)
+                + f" | matched={matched}"
+                + f" | unmatched={counts['unmatched']}"
+            )
+            lines.append("  " + " | ".join(parts))
+
+    return lines
+
+
+def fold_balance_section(rows, fold_assignments):
+    lines = [
+        "",
+        "=" * 115,
+        "TOPIC-PAIRED FIVE-FOLD TRAIN / TEST BALANCE",
+        "=" * 115,
+        "",
+        "Seed 42: new topic-pair-disjoint five folds.",
+        "Each test fold contains 20 matched topic indices (40 base prompts).",
+        "Both safety classes, all languages, conditions and modalities remain grouped.",
+        "Rates are from carefully rechecked adjudications only.",
+        "Delta = test rate minus train rate, in percentage points.",
+    ]
+
+    groupings = (
+        ("OVERALL", ("modality", "split")),
+        ("BY LANGUAGE", ("modality", "split", "language")),
+        ("BY CONDITION", ("modality", "split", "condition")),
+        (
+            "BY LANGUAGE AND CONDITION",
+            ("modality", "split", "language", "condition"),
+        ),
+    )
+
+    for fold in FOLDS:
+        lines.extend([
+            "",
+            "=" * 115,
+            f"FOLD {fold}",
+            "=" * 115,
+        ])
+
+        train = [
+            row for row in rows
+            if fold_assignments[row["base_id"]] != fold
+        ]
+        test = [
+            row for row in rows
+            if fold_assignments[row["base_id"]] == fold
+        ]
+
+        lines.append(
+            f"Train examples={len(train)} | Test examples={len(test)}"
+        )
+
+        for title, dimensions in groupings:
+            lines.extend([
+                "",
+                title,
+                "-" * 115,
+                f"{'Group':58s} {'Metric':5s} "
+                f"{'Train N':>7s} {'Test N':>7s} "
+                f"{'Train %':>9s} {'Test %':>9s} {'Delta pp':>9s}",
+                "-" * 115,
+            ])
+
+            train_stats = {
+                item["key"]: item
+                for item in summarize(train, dimensions)
+            }
+            test_stats = {
+                item["key"]: item
+                for item in summarize(test, dimensions)
+            }
+
+            for key in sorted(set(train_stats) | set(test_stats)):
+                a = train_stats.get(key)
+                b = test_stats.get(key)
+
+                na = a["n"] if a else 0
+                nb = b["n"] if b else 0
+
+                ra = a["rate"] if a else None
+                rb = b["rate"] if b else None
+
+                metric = "ASR" if "harmful" in key else "BRR"
+                label = " | ".join(key)
+
+                train_rate = f"{ra:.2f}%" if ra is not None else "N/A"
+                test_rate = f"{rb:.2f}%" if rb is not None else "N/A"
+                delta = (
+                    f"{rb - ra:+.2f}"
+                    if ra is not None and rb is not None else "N/A"
+                )
+
+                lines.append(
+                    f"{label[:58]:58s} {metric:5s} "
+                    f"{na:7d} {nb:7d} "
+                    f"{train_rate:>9s} {test_rate:>9s} "
+                    f"{delta:>9s}"
+                )
+
+    return lines
+
+
+def preserve_previous_split(output):
+    previous = (
+        "train.csv",
+        "test.csv",
+        "base_prompt_split.csv",
+    )
+
+    present = [
+        output / name
+        for name in previous
+        if (output / name).is_file()
+    ]
+
+    if not present:
+        return
+
+    archive = output / "prev_75_25"
+
+    for path in present:
+        destination = archive / path.name
+        if destination.exists():
+            if path.read_bytes() == destination.read_bytes():
+                path.unlink()
+                continue
+            raise FileExistsError(
+                f"Different archived file already exists: {destination}"
+            )
+
+        archive.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(destination))
+
+
+def write_fold_outputs(output, rows, base_folds):
+    fields = (
+        "task_id",
+        "base_id",
+        "split",
+        "modality",
+        "language",
+        "condition",
+        "decision",
+        "test_fold",
+    )
+
+    all_records = [
+        {**row, "test_fold": base_folds[row["base_id"]]}
+        for row in rows
+    ]
+    all_records.sort(key=lambda row: row["task_id"])
+
+    write_csv(
+        output / "fold_assignments.csv",
+        all_records,
+        fields,
+    )
+
+    base_rows = []
+
+    for base_id, fold in sorted(base_folds.items()):
+        split = read_task_id(
+            base_id + "__original__english__text"
+        )[1]
+        base_rows.append({
+            "base_id": base_id,
+            "split": split,
+            "test_fold": fold,
+        })
+
+    write_csv(
+        output / "base_prompt_folds.csv",
+        base_rows,
+        ("base_id", "split", "test_fold"),
+    )
+
+    folds_dir = output / "folds"
+    partition_fields = fields + ("partition",)
+
+    for fold in FOLDS:
+        for partition in ("train", "test"):
+            selected = []
+
+            for row in all_records:
+                is_test = row["test_fold"] == fold
+
+                if (partition == "test") != is_test:
+                    continue
+
+                selected.append({
+                    **row,
+                    "partition": partition,
+                })
+
+            write_csv(
+                folds_dir / f"fold_{fold}_{partition}.csv",
+                selected,
+                partition_fields,
+            )
+
+
+def audit_model(model, canonical_ids, base_folds):
+    rows, missing = load_judgments(model)
+
+    if not rows:
+        print(f"\n===== {model}: NO CAREFULLY RECHECKED INPUTS =====")
+        return
+
+    actual_ids = {row["task_id"] for row in rows}
+
+    unknown = actual_ids - canonical_ids
+
+    if unknown:
+        raise ValueError(
+            f"{model}: {len(unknown)} task IDs absent from fold manifests"
+        )
+
+    output = RESULTS / model / "wk3/dataset_summary"
+    output.mkdir(parents=True, exist_ok=True)
+
+    preserve_previous_split(output)
+    write_fold_outputs(output, rows, base_folds)
+
+    pairs = paired_examples(rows)
+
+    write_csv(
+        output / "paired_examples.csv",
+        pairs,
+        (
+            "base_id",
+            "split",
+            "language",
+            "condition",
+            "text_decision",
+            "audio_decision",
+            "transition",
+        ),
+    )
+
+    grouped = defaultdict(Counter)
+
+    for row in pairs:
+        for dimensions in (
+            ("split",),
+            ("split", "language"),
+            ("split", "condition"),
+            ("split", "language", "condition"),
+        ):
+            key = (
+                "|".join(dimensions),
+                "|".join(row[field] for field in dimensions),
+            )
+            grouped[key][row["transition"]] += 1
+
+    transition_rows = []
+
+    for (grouping, key), counts in sorted(grouped.items()):
+        transition_rows.append({
+            "grouping": grouping,
+            "group": key,
+            **{
+                transition: counts[transition]
+                for transition in (
+                    "0->0", "0->1", "1->0", "1->1", "unmatched"
+                )
+            },
+        })
+
+    write_csv(
+        output / "paired_transitions.csv",
+        transition_rows,
+        (
+            "grouping",
+            "group",
+            "0->0",
+            "0->1",
+            "1->0",
+            "1->1",
+            "unmatched",
+        ),
+    )
+
+    base_inventory = defaultdict(list)
+
+    for row in rows:
+        base_inventory[row["base_id"]].append(row)
+
+    inventory_rows = []
+
+    for base_id, group in sorted(base_inventory.items()):
+        inventory_rows.append({
+            "base_id": base_id,
+            "split": group[0]["split"],
+            "test_fold": base_folds[base_id],
+            "n_examples": len(group),
+            "n_text": sum(r["modality"] == "text" for r in group),
+            "n_audio": sum(r["modality"] == "audio" for r in group),
+            "languages": "|".join(sorted({
+                r["language"] for r in group
+            })),
+            "conditions": "|".join(sorted({
+                r["condition"] for r in group
+            })),
+        })
+
+    write_csv(
+        output / "base_prompt_inventory.csv",
+        inventory_rows,
+        (
+            "base_id",
+            "split",
+            "test_fold",
+            "n_examples",
+            "n_text",
+            "n_audio",
+            "languages",
+            "conditions",
+        ),
+    )
+
+    manifest = {
+        "model": model,
+        "judgments": "carefully_rechecked_only",
+        "fold_source": "seeded_topic_index_grouping",
+        "fold_seed": 42,
+        "fold_source_inventory": str(FOLD_SOURCE / "fold_1.jsonl"),
+        "topic_pair_grouping": "matched_benign_harmful_index",
+        "fold_count": 5,
+        "test_fraction_per_fold": 0.20,
+        "grouping": "topic_index_across_benign_and_harmful",
+        "total_examples": len(rows),
+        "unique_base_prompts": len(base_inventory),
+        "missing_judgment_files": missing,
+        "missing_fold_manifest_tasks": len(canonical_ids - actual_ids),
+        "representation_directory": str(
+            RESULTS / model / "5fold/representations_shared"
+        ),
+        "decision_semantics": {
+            "harmful": "1 = harmful compliance (ASR)",
+            "benign": "1 = benign refusal (BRR)",
+        },
+    }
+
+    with (output / "audit_manifest.json").open(
+        "w", encoding="utf-8"
+    ) as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+
+    lines = [
+        f"DATASET AUDIT: {model}",
+        "=" * 115,
+        "",
+        f"Total adjudicated examples: {len(rows)}",
+        f"Base prompts: {len(base_inventory)}",
+        f"Matched text/audio pairs: "
+        f"{sum(p['transition'] != 'unmatched' for p in pairs)}",
+        f"Unmatched pairs: "
+        f"{sum(p['transition'] == 'unmatched' for p in pairs)}",
+        "",
+        "Adjudications: carefully rechecked JSONLs only",
+        "Splits: seed-42 topic-pair-disjoint five-fold cross-validation",
+        "Harmful decision=1: harmful compliance (ASR)",
+        "Benign decision=1: inappropriate refusal (BRR)",
+        "",
+        "MISSING JUDGMENT FILES",
+    ]
+
+    lines.extend(
+        f"  {name}" for name in missing
+    )
+    if not missing:
+        lines.append("  None")
+
+    for title, dimensions in (
+        ("OVERALL ASR / BRR", ()),
+        ("ASR / BRR BY CONDITION", ("condition",)),
+        ("ASR / BRR BY LANGUAGE", ("language",)),
+        (
+            "ASR / BRR BY LANGUAGE AND CONDITION",
+            ("language", "condition"),
+        ),
+    ):
+        lines.extend(comparison_section(rows, title, dimensions))
+
+    lines.extend(transition_section(pairs))
+    lines.extend(fold_balance_section(rows, base_folds))
+
+    lines.extend([
+        "",
+        "=" * 115,
+        "AUDIT COMPLETE",
+        "=" * 115,
+        "",
+    ])
+
+    (output / "summary.txt").write_text(
+        "\n".join(lines),
+        encoding="utf-8",
+    )
+
+    print(f"\n===== {model} =====")
+    print(f"Total examples: {len(rows)}")
+    print(f"Base prompts: {len(base_inventory)}")
+    print(f"Missing source files: {len(missing)}")
+
+    for item in summarize(rows, ("modality", "split")):
+        print(
+            f"  {' | '.join(item['key']):18s} "
+            f"{item['metric']}={item['rate']:.2f}% "
+            f"({item['positive']}/{item['n']})"
+        )
+
+    print(f"Report: {output / 'summary.txt'}")
+
+
+def main():
+    canonical_ids, base_folds, manifests = load_existing_folds()
+
+    for model in MODELS:
+        audit_model(model, canonical_ids, base_folds)
+
+    print("\nALL FIVE-FOLD DATASET AUDITS COMPLETE")
+
+
+if __name__ == "__main__":
+    main()
