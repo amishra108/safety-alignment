@@ -1,0 +1,3 @@
+Directory: audio_jailbreak_clean_benchmark
+Purpose: Multilingual benchmark of harmful and benign prompts across text/audio modalities.
+Large downloaded assets are excluded from GitHub.

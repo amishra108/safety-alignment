@@ -1,0 +1,3 @@
+Directory: xstest
+Purpose: XSTest safety evaluation dataset.
+Large downloaded assets are excluded from GitHub.

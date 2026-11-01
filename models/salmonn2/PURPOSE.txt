@@ -1,0 +1,3 @@
+Directory: salmonn2
+Purpose: Audio-language model used for safety evaluation.
+Large downloaded assets are excluded from GitHub.

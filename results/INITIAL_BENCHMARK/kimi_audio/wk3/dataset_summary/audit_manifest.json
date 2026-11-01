@@ -1,0 +1,20 @@
+{
+  "model": "kimi_audio",
+  "judgments": "carefully_rechecked_only",
+  "fold_source": "seeded_topic_index_grouping",
+  "fold_seed": 42,
+  "fold_source_inventory": "/research/milsrg1/user_workspace/am3244/safety-alignment/results/INITIAL_BENCHMARK/qwen2_audio/5fold/fold_1.jsonl",
+  "topic_pair_grouping": "matched_benign_harmful_index",
+  "fold_count": 5,
+  "test_fraction_per_fold": 0.2,
+  "grouping": "topic_index_across_benign_and_harmful",
+  "total_examples": 6400,
+  "unique_base_prompts": 200,
+  "missing_judgment_files": [],
+  "missing_fold_manifest_tasks": 0,
+  "representation_directory": "/research/milsrg1/user_workspace/am3244/safety-alignment/results/INITIAL_BENCHMARK/kimi_audio/5fold/representations_shared",
+  "decision_semantics": {
+    "harmful": "1 = harmful compliance (ASR)",
+    "benign": "1 = benign refusal (BRR)"
+  }
+}

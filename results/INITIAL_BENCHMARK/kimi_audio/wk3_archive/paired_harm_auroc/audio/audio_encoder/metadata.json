@@ -1,0 +1,26 @@
+{
+  "model": "kimi_audio",
+  "modality": "audio",
+  "component": "audio_encoder",
+  "fivefold": "seed42_topic_pair_disjoint",
+  "heldout_topic_indices_per_fold": 20,
+  "heldout_pairs_per_fold": 320,
+  "total_out_of_fold_pairs": 1600,
+  "methods": [
+    "mean",
+    "svd_1",
+    "svd_2",
+    "svd_4",
+    "svd_8",
+    "svd_16",
+    "svd_32",
+    "svd_64",
+    "svd_128"
+  ],
+  "score": "dot_product_with_training_direction",
+  "svd_k_direction": "normalized_projection_of_training_harmful_minus_benign_mean_onto_training_top_k_svd_subspace",
+  "auroc": "heldout_harmful_vs_benign_classification",
+  "paired_accuracy": "fraction_harmful_score_greater_than_matched_benign_score_with_half_credit_for_ties",
+  "normalization": "none_applied_to_individual_activations",
+  "csv_decimal_places": 3
+}

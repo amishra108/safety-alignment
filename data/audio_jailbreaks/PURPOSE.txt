@@ -1,0 +1,3 @@
+Directory: audio_jailbreaks
+Purpose: Local research assets used by this project. See scripts for details.
+Large downloaded assets are excluded from GitHub.

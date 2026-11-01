@@ -1,0 +1,3 @@
+Directory: qwen2.5-omni-7b
+Purpose: Primary safety evaluation model. Text/audio benchmarking, representation analysis and activation steering.
+Large downloaded assets are excluded from GitHub.

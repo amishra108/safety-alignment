@@ -1,0 +1,3 @@
+Directory: audio-flamingo-3
+Purpose: Audio-language evaluation model used for safety benchmarking.
+Large downloaded assets are excluded from GitHub.

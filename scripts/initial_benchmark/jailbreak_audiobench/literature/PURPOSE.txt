@@ -1,0 +1,8 @@
+This directory contains third-party code obtained from the GitHub
+repository accompanying the corresponding published research paper.
+
+The original code is retained locally for research and reproducibility.
+It is intentionally not redistributed in this repository.
+
+Refer to the original paper and its official GitHub repository for
+the source code, documentation, and licensing information.

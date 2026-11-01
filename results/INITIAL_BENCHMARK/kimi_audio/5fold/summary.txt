@@ -1,0 +1,208 @@
+MODEL: kimi_audio
+TOTAL ROWS: 6400
+UNIQUE BASE PROMPTS: 200
+BENIGN BASE PROMPTS: 100
+HARMFUL BASE PROMPTS: 100
+SEED: 42
+REFERENCE FOLDS: qwen25_omni
+
+
+========================================================================================
+FOLD 1
+========================================================================================
+
+TRAIN
+  rows        : 5120
+  base prompts: 160
+  language    : chinese=1280, english=1280, russian=1280, spanish=1280
+  condition   : content_dilution=1280, literal=1280, narrative_framing=1280, original=1280
+  safety      : benign=2560, harmful=2560
+  modality    : audio=2560, text=2560
+  decision    : 0=3888, 1=1232
+
+  BENIGN
+    text      : 0=1110, 1=170
+    audio     : 0=899, 1=381
+
+  HARMFUL
+    text      : 0=813, 1=467
+    audio     : 0=1066, 1=214
+
+TEST
+  rows        : 1280
+  base prompts: 40
+  language    : chinese=320, english=320, russian=320, spanish=320
+  condition   : content_dilution=320, literal=320, narrative_framing=320, original=320
+  safety      : benign=640, harmful=640
+  modality    : audio=640, text=640
+  decision    : 0=935, 1=345
+
+  BENIGN
+    text      : 0=276, 1=44
+    audio     : 0=202, 1=118
+
+  HARMFUL
+    text      : 0=189, 1=131
+    audio     : 0=268, 1=52
+
+  prompt overlap train/test: 0
+
+========================================================================================
+FOLD 2
+========================================================================================
+
+TRAIN
+  rows        : 5120
+  base prompts: 160
+  language    : chinese=1280, english=1280, russian=1280, spanish=1280
+  condition   : content_dilution=1280, literal=1280, narrative_framing=1280, original=1280
+  safety      : benign=2560, harmful=2560
+  modality    : audio=2560, text=2560
+  decision    : 0=3827, 1=1293
+
+  BENIGN
+    text      : 0=1094, 1=186
+    audio     : 0=874, 1=406
+
+  HARMFUL
+    text      : 0=789, 1=491
+    audio     : 0=1070, 1=210
+
+TEST
+  rows        : 1280
+  base prompts: 40
+  language    : chinese=320, english=320, russian=320, spanish=320
+  condition   : content_dilution=320, literal=320, narrative_framing=320, original=320
+  safety      : benign=640, harmful=640
+  modality    : audio=640, text=640
+  decision    : 0=996, 1=284
+
+  BENIGN
+    text      : 0=292, 1=28
+    audio     : 0=227, 1=93
+
+  HARMFUL
+    text      : 0=213, 1=107
+    audio     : 0=264, 1=56
+
+  prompt overlap train/test: 0
+
+========================================================================================
+FOLD 3
+========================================================================================
+
+TRAIN
+  rows        : 5120
+  base prompts: 160
+  language    : chinese=1280, english=1280, russian=1280, spanish=1280
+  condition   : content_dilution=1280, literal=1280, narrative_framing=1280, original=1280
+  safety      : benign=2560, harmful=2560
+  modality    : audio=2560, text=2560
+  decision    : 0=3872, 1=1248
+
+  BENIGN
+    text      : 0=1133, 1=147
+    audio     : 0=891, 1=389
+
+  HARMFUL
+    text      : 0=791, 1=489
+    audio     : 0=1057, 1=223
+
+TEST
+  rows        : 1280
+  base prompts: 40
+  language    : chinese=320, english=320, russian=320, spanish=320
+  condition   : content_dilution=320, literal=320, narrative_framing=320, original=320
+  safety      : benign=640, harmful=640
+  modality    : audio=640, text=640
+  decision    : 0=951, 1=329
+
+  BENIGN
+    text      : 0=253, 1=67
+    audio     : 0=210, 1=110
+
+  HARMFUL
+    text      : 0=211, 1=109
+    audio     : 0=277, 1=43
+
+  prompt overlap train/test: 0
+
+========================================================================================
+FOLD 4
+========================================================================================
+
+TRAIN
+  rows        : 5120
+  base prompts: 160
+  language    : chinese=1280, english=1280, russian=1280, spanish=1280
+  condition   : content_dilution=1280, literal=1280, narrative_framing=1280, original=1280
+  safety      : benign=2560, harmful=2560
+  modality    : audio=2560, text=2560
+  decision    : 0=3863, 1=1257
+
+  BENIGN
+    text      : 0=1099, 1=181
+    audio     : 0=870, 1=410
+
+  HARMFUL
+    text      : 0=817, 1=463
+    audio     : 0=1077, 1=203
+
+TEST
+  rows        : 1280
+  base prompts: 40
+  language    : chinese=320, english=320, russian=320, spanish=320
+  condition   : content_dilution=320, literal=320, narrative_framing=320, original=320
+  safety      : benign=640, harmful=640
+  modality    : audio=640, text=640
+  decision    : 0=960, 1=320
+
+  BENIGN
+    text      : 0=287, 1=33
+    audio     : 0=231, 1=89
+
+  HARMFUL
+    text      : 0=185, 1=135
+    audio     : 0=257, 1=63
+
+  prompt overlap train/test: 0
+
+========================================================================================
+FOLD 5
+========================================================================================
+
+TRAIN
+  rows        : 5120
+  base prompts: 160
+  language    : chinese=1280, english=1280, russian=1280, spanish=1280
+  condition   : content_dilution=1280, literal=1280, narrative_framing=1280, original=1280
+  safety      : benign=2560, harmful=2560
+  modality    : audio=2560, text=2560
+  decision    : 0=3842, 1=1278
+
+  BENIGN
+    text      : 0=1108, 1=172
+    audio     : 0=870, 1=410
+
+  HARMFUL
+    text      : 0=798, 1=482
+    audio     : 0=1066, 1=214
+
+TEST
+  rows        : 1280
+  base prompts: 40
+  language    : chinese=320, english=320, russian=320, spanish=320
+  condition   : content_dilution=320, literal=320, narrative_framing=320, original=320
+  safety      : benign=640, harmful=640
+  modality    : audio=640, text=640
+  decision    : 0=981, 1=299
+
+  BENIGN
+    text      : 0=278, 1=42
+    audio     : 0=231, 1=89
+
+  HARMFUL
+    text      : 0=204, 1=116
+    audio     : 0=268, 1=52
+
+  prompt overlap train/test: 0

@@ -1,0 +1,20 @@
+{
+  "benchmark": "XSTest",
+  "model": "audio_flamingo3",
+  "expected_examples": 450,
+  "expected_safe": 250,
+  "expected_unsafe": 200,
+  "text_rows": 450,
+  "audio_rows": 450,
+  "safe_rows": {
+    "text": 250,
+    "audio": 250
+  },
+  "unsafe_rows": {
+    "text": 200,
+    "audio": 200
+  },
+  "judge_applied": false,
+  "judge": "Official XSTest completion classifier to be applied separately",
+  "kimi_text_condition": "text_only"
+}

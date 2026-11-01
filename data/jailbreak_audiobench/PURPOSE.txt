@@ -1,0 +1,3 @@
+Directory: jailbreak_audiobench
+Purpose: Jailbreak-AudioBench safety evaluation dataset.
+Large downloaded assets are excluded from GitHub.

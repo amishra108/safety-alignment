@@ -1,0 +1,3 @@
+Directory: qwen3-4b
+Purpose: Auxiliary model used for safety adjudication.
+Large downloaded assets are excluded from GitHub.

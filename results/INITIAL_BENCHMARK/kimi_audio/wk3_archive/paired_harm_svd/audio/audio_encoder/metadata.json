@@ -1,0 +1,32 @@
+{
+  "model": "kimi_audio",
+  "modality": "audio",
+  "component": "audio_encoder",
+  "difference": "harmful_minus_benign",
+  "total_topic_pairs": 100,
+  "differences_per_modality": 1600,
+  "train_differences_per_fold": 1280,
+  "test_differences_per_fold": 320,
+  "folds": 5,
+  "k_values": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "first_boundary": 0,
+  "svd_method": "uncentered_randomized_svd",
+  "oversampling": 32,
+  "power_iterations": 3,
+  "component_scores": "D_times_V",
+  "train_u": "approximate_left_singular_coordinates_calculated_as_DV_divided_by_singular_values",
+  "subspace_similarity": "mean_cosine_of_principal_angles",
+  "audio_encoder_pooling": "mean_over_eight_temporal_bins",
+  "csv_decimal_places": 3,
+  "saved_arrays_unrounded": true,
+  "seed": 42
+}

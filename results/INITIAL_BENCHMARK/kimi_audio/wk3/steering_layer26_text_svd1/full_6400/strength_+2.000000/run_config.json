@@ -1,0 +1,22 @@
+{
+  "direction_method": "svd_1",
+  "direction_sha256": {
+    "1": "137b490a7ce4812d2f8ed3ecc079917ef4bc2b0b9ad533767726a98484a52839",
+    "2": "150d876bc415239a9bb6ca36785c1fa29862a9422e3d25e4093521b215593b30",
+    "3": "f574a02af1c708e9b7705eb87f2499328e55757a4b76e7d6f4967a2bbcfa70fa",
+    "4": "f1edaa331833fc11031b93b11104bc8be48d8514dbe7ffde01f079b639969bbe",
+    "5": "b458260a4d37b63999f9fff765246fb8af877d1bb99db3e679048cbed2a2cef7"
+  },
+  "direction_source": "text",
+  "examples": 3200,
+  "generations": 6400,
+  "generator_sha256": "5fb35c81e25bb8efc629a66a26bf58db86d1041ff74ab2680763ab9debf6689b",
+  "layer_boundary": 26,
+  "manifest_sha256": "d3ce2d026b9ba76cf444b4ac4b34aae95b4d13b6aefec5f176af4e0e2eb28360",
+  "modality": "both",
+  "model": "kimi_audio",
+  "num_shards": 1,
+  "selection": "default",
+  "steering_script_sha256": "590610902533be748382919dcc17b4d7d60ef638dc1e920214b130d5e7d1924a",
+  "strength": 2.0
+}

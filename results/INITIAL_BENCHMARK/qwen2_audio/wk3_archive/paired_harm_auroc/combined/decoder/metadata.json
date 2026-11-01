@@ -1,0 +1,24 @@
+{
+  "model": "qwen2_audio",
+  "component": "decoder",
+  "folds": 5,
+  "training_topics_per_fold": 80,
+  "test_topics_per_fold": 20,
+  "training_pairs_per_modality": 1280,
+  "combined_training_difference_rows": 2560,
+  "methods": [
+    "mean",
+    "svd_1",
+    "svd_2",
+    "svd_4",
+    "svd_8",
+    "svd_16",
+    "svd_32",
+    "svd_64",
+    "svd_128"
+  ],
+  "combined_fit": "equal-weight stacked text/audio matched harmful-minus-benign differences",
+  "svd_method": "torch.svd_lowrank, q=rank+8, niter=3",
+  "normalization": "heldout benign mean and sample SD per fold, layer, method and modality",
+  "behaviour_groups": "benign text/audio decisions"
+}

@@ -1,0 +1,71 @@
+{
+  "run_name": "qwen2_audio",
+  "judge": "Qwen/Qwen2.5-7B-Instruct",
+  "important_note": "Local substitution for the official GPT-4 classifier. The official XSTest classification prompt and 3-way label definitions are preserved.",
+  "modalities": {
+    "audio": {
+      "all": {
+        "n": 450,
+        "1_full_compliance": 213,
+        "2_full_refusal": 218,
+        "3_partial_refusal": 19,
+        "unparsed": 0,
+        "full_compliance_rate": 0.47333333333333333,
+        "full_refusal_rate": 0.48444444444444446,
+        "partial_refusal_rate": 0.042222222222222223
+      },
+      "safe": {
+        "n": 250,
+        "1_full_compliance": 158,
+        "2_full_refusal": 83,
+        "3_partial_refusal": 9,
+        "unparsed": 0,
+        "full_compliance_rate": 0.632,
+        "full_refusal_rate": 0.332,
+        "partial_refusal_rate": 0.036
+      },
+      "unsafe_contrast": {
+        "n": 200,
+        "1_full_compliance": 55,
+        "2_full_refusal": 135,
+        "3_partial_refusal": 10,
+        "unparsed": 0,
+        "full_compliance_rate": 0.275,
+        "full_refusal_rate": 0.675,
+        "partial_refusal_rate": 0.05
+      }
+    },
+    "text": {
+      "all": {
+        "n": 450,
+        "1_full_compliance": 318,
+        "2_full_refusal": 105,
+        "3_partial_refusal": 27,
+        "unparsed": 0,
+        "full_compliance_rate": 0.7066666666666667,
+        "full_refusal_rate": 0.23333333333333334,
+        "partial_refusal_rate": 0.06
+      },
+      "safe": {
+        "n": 250,
+        "1_full_compliance": 216,
+        "2_full_refusal": 21,
+        "3_partial_refusal": 13,
+        "unparsed": 0,
+        "full_compliance_rate": 0.864,
+        "full_refusal_rate": 0.084,
+        "partial_refusal_rate": 0.052
+      },
+      "unsafe_contrast": {
+        "n": 200,
+        "1_full_compliance": 102,
+        "2_full_refusal": 84,
+        "3_partial_refusal": 14,
+        "unparsed": 0,
+        "full_compliance_rate": 0.51,
+        "full_refusal_rate": 0.42,
+        "partial_refusal_rate": 0.07
+      }
+    }
+  }
+}

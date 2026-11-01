@@ -1,0 +1,3 @@
+Directory: sacred_bench
+Purpose: SACRED-Bench audio safety evaluation dataset.
+Large downloaded assets are excluded from GitHub.

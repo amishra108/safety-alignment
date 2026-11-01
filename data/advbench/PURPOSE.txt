@@ -1,0 +1,3 @@
+Directory: advbench
+Purpose: AdvBench harmful request evaluation dataset.
+Large downloaded assets are excluded from GitHub.
