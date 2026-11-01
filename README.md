@@ -89,8 +89,8 @@ These experiments examine whether the directions identified through representati
 - `scripts/preprocessing/` — Dataset preparation, translation, and audio synthesis.
 - `scripts/initial_benchmark/` — Benchmark evaluation and response analysis.
 - `scripts/exploring_safety/` — Representation extraction, linear probing, SVD, and cross-modal analysis.
-- `scripts/wk3/` — Harmfulness-direction and activation steering experiments.
-- `scripts/wk3_archive/` — Earlier experimental scripts.
+- `scripts/harmfulness/` — Harmfulness-direction and activation steering experiments.
+- `scripts/harmfulness/archive/` — Earlier experimental scripts.
 - `data/` — Selected dataset manifests, metadata, and descriptions.
 - `models/` — Model descriptions and intended uses.
 - `outputs/` — Selected experimental outputs.
@@ -106,7 +106,7 @@ The repository consists of research scripts rather than a standalone Python pack
 
 To reproduce an experiment, obtain the required pretrained models and datasets, prepare the benchmark inputs using `scripts/preprocessing/`, and run the relevant evaluation or analysis scripts.
 
-The representation analysis and activation steering experiments are primarily located in `scripts/exploring_safety/` and `scripts/wk3/`.
+The representation analysis and activation steering experiments are primarily located in `scripts/exploring_safety/` and `scripts/harmfulness/`.
 
 The scripts were developed for GPU-enabled research environments and may require adjustments to local model paths, dependencies, and hardware configurations.
 

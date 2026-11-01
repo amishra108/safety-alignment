@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+ROOT = Path("/research/milsrg1/user_workspace/am3244/safety-alignment")
+RESULTS = ROOT / "results/INITIAL_BENCHMARK"
+
+MODELS = {
+    "qwen2_audio": {
+        "decoder": "decoder",
+        "audio_encoder": "audio_encoder",
+    },
+    "qwen25_omni": {
+        "thinker": "thinker",
+        "audio_encoder": "audio_encoder",
+    },
+    "kimi_audio": {
+        "shared_decoder": "shared_decoder",
+        "text_mimo": "text_mimo",
+        "audio_encoder": "audio_encoder",
+    },
+}
+
+LANGUAGES = ("chinese", "english", "russian", "spanish")
+CONDITIONS = (
+    "content_dilution",
+    "literal",
+    "narrative_framing",
+    "original",
+)
+FOLDS = (1, 2, 3, 4, 5)
+
+
+def read_csv(path):
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def write_csv(path, rows, columns):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def task_id(safety, index, condition, language, modality):
+    return (
+        f"jbb_{safety}_{index:03d}__"
+        f"{condition}__{language}__{modality}"
+    )
+
+
+def load_fold_assignment(model):
+    base = RESULTS / model / "wk3/dataset_summary"
+    assignments = {}
+
+    for fold in FOLDS:
+        path = base / "folds" / f"fold_{fold}_test.csv"
+        rows = read_csv(path)
+
+        if len(rows) != 1280:
+            raise ValueError(f"{path}: expected 1280 rows")
+
+        for row in rows:
+            if row["partition"] != "test":
+                raise ValueError(f"Invalid partition in {path}")
+
+            if int(row["test_fold"]) != fold:
+                raise ValueError(f"Incorrect test_fold in {path}")
+
+            index = int(row["base_id"].rsplit("_", 1)[1])
+
+            old = assignments.get(index)
+            if old is not None and old != fold:
+                raise ValueError(f"Topic index {index} crosses folds")
+
+            assignments[index] = fold
+
+    if set(assignments) != set(range(100)):
+        raise ValueError("Expected exactly 100 topic indices")
+
+    for fold in FOLDS:
+        if sum(value == fold for value in assignments.values()) != 20:
+            raise ValueError(f"Fold {fold} lacks 20 topic indices")
+
+    return assignments
+
+
+def check_complete_manifest(model):
+    path = (
+        RESULTS / model
+        / "wk3/dataset_summary/fold_assignments.csv"
+    )
+    rows = read_csv(path)
+
+    if len(rows) != 6400:
+        raise ValueError(f"{model}: expected 6400 manifest rows")
+
+    by_id = {row["task_id"]: row for row in rows}
+
+    if len(by_id) != 6400:
+        raise ValueError(f"{model}: duplicate task IDs")
+
+    assignments = load_fold_assignment(model)
+
+    for index in range(100):
+        for language in LANGUAGES:
+            for condition in CONDITIONS:
+                for modality in ("text", "audio"):
+                    for safety in ("benign", "harmful"):
+                        key = task_id(
+                            safety, index, condition, language, modality
+                        )
+                        if key not in by_id:
+                            raise ValueError(f"Missing task: {key}")
+
+                        row = by_id[key]
+
+                        if int(row["test_fold"]) != assignments[index]:
+                            raise ValueError(f"Fold mismatch: {key}")
+
+                        if row["split"] != safety:
+                            raise ValueError(f"Split mismatch: {key}")
+
+    return assignments
+
+
+def read_representation(path, expected_task, key):
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    obj = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=True,
+    )
+
+    if obj.get("task_id") != expected_task:
+        raise ValueError(f"Representation identity mismatch: {path}")
+
+    if key not in obj:
+        raise KeyError(f"{path}: missing tensor {key}")
+
+    tensor = obj[key]
+
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"{path}: {key} is not a tensor")
+
+    if key == "audio_encoder":
+        if tensor.ndim != 3 or tensor.shape[1] != 8:
+            raise ValueError(f"{path}: unexpected audio encoder shape")
+        tensor = tensor.float().mean(dim=1)
+    else:
+        if tensor.ndim != 2:
+            raise ValueError(f"{path}: unexpected shape for {key}")
+
+    arr = tensor.numpy().astype(np.float32, copy=False)
+
+    if not np.isfinite(arr).all():
+        raise ValueError(f"{path}: nonfinite representations")
+
+    return arr
+
+
+def load_differences(model, modality, component):
+    rep_root = (
+        RESULTS / model / "5fold/representations_shared"
+    )
+
+    keys = []
+    differences = None
+    row_number = 0
+
+    for index in range(100):
+        for language in LANGUAGES:
+            for condition in CONDITIONS:
+                benign_id = task_id(
+                    "benign", index, condition, language, modality
+                )
+                harmful_id = task_id(
+                    "harmful", index, condition, language, modality
+                )
+
+                benign = read_representation(
+                    rep_root / f"{benign_id}.pt",
+                    benign_id,
+                    component,
+                )
+                harmful = read_representation(
+                    rep_root / f"{harmful_id}.pt",
+                    harmful_id,
+                    component,
+                )
+
+                if harmful.shape != benign.shape:
+                    raise ValueError(
+                        f"Representation shape mismatch at {index}"
+                    )
+
+                if differences is None:
+                    layers, width = harmful.shape
+                    differences = np.empty(
+                        (1600, layers, width),
+                        dtype=np.float32,
+                    )
+
+                if harmful.shape != differences.shape[1:]:
+                    raise ValueError(
+                        f"Inconsistent layer dimensions: {harmful_id}"
+                    )
+
+                differences[row_number] = harmful - benign
+                keys.append((index, language, condition))
+                row_number += 1
+
+        if (index + 1) % 20 == 0:
+            print(
+                f"    Loaded {index + 1}/100 topic pairs",
+                flush=True,
+            )
+
+    if row_number != 1600:
+        raise ValueError("Expected 1600 matched differences")
+
+    return differences, keys
+
+
+def randomized_svd(matrix, rank, rng, n_iter=2):
+    n, width = matrix.shape
+    k = min(rank, n, width)
+    sketch_width = min(k + 8, n, width)
+
+    omega = rng.standard_normal(
+        (width, sketch_width),
+        dtype=np.float32,
+    )
+
+    y = matrix @ omega
+
+    for _ in range(n_iter):
+        q, _ = np.linalg.qr(y, mode="reduced")
+        z = matrix.T @ q
+        qz, _ = np.linalg.qr(z, mode="reduced")
+        y = matrix @ qz
+
+    q, _ = np.linalg.qr(y, mode="reduced")
+    compressed = q.T @ matrix
+
+    _, singular_values, vt = np.linalg.svd(
+        compressed,
+        full_matrices=False,
+    )
+
+    return (
+        singular_values[:k].astype(np.float64),
+        vt[:k].astype(np.float32),
+    )
+
+
+def principal_angles(left, right):
+    products = left @ right.T
+    cosines = np.linalg.svd(
+        products,
+        compute_uv=False,
+    )
+    cosines = np.clip(cosines, 0.0, 1.0)
+
+    angles = np.degrees(np.arccos(cosines))
+
+    return cosines, angles
+
+
+def analyze_fold(
+    differences,
+    keys,
+    assignments,
+    fold,
+    rank,
+    seed,
+    destination,
+):
+    topic_indices = np.array(
+        [key[0] for key in keys],
+        dtype=np.int32,
+    )
+
+    train_rows = np.array(
+        [assignments[int(index)] != fold for index in topic_indices]
+    )
+    test_rows = ~train_rows
+
+    train = differences[train_rows]
+    test = differences[test_rows]
+
+    if train.shape[0] != 1280 or test.shape[0] != 320:
+        raise ValueError(f"Unexpected fold sizes: {fold}")
+
+    layers = differences.shape[1]
+    width = differences.shape[2]
+
+    actual_rank = min(rank, train.shape[0], width)
+
+    vectors = np.empty(
+        (layers, actual_rank, width),
+        dtype=np.float32,
+    )
+    means = np.empty(
+        (layers, width),
+        dtype=np.float32,
+    )
+    singular_values = np.empty(
+        (layers, actual_rank),
+        dtype=np.float64,
+    )
+
+    rng = np.random.default_rng(seed + fold)
+
+    energy_rows = []
+    overlap_rows = []
+
+    previous_vectors = None
+    previous_mean = None
+
+    for layer in range(layers):
+        x = np.ascontiguousarray(train[:, layer, :])
+        heldout = np.ascontiguousarray(test[:, layer, :])
+
+        mean = np.mean(x, axis=0, dtype=np.float64)
+        mean = mean.astype(np.float32)
+
+        mean_norm = float(np.linalg.norm(mean))
+
+        train_energy = float(
+            np.sum(x.astype(np.float64) ** 2)
+        )
+        test_energy = float(
+            np.sum(heldout.astype(np.float64) ** 2)
+        )
+
+        s, basis = randomized_svd(
+            x,
+            actual_rank,
+            rng,
+        )
+
+        vectors[layer] = basis
+        means[layer] = mean
+        singular_values[layer] = s
+
+        energy = s ** 2
+        cumulative = np.cumsum(energy)
+
+        if mean_norm > 0:
+            mean_unit = mean / mean_norm
+            train_mean_energy = (
+                x @ mean_unit
+            ).astype(np.float64)
+            test_mean_projection = (
+                heldout @ mean_unit
+            ).astype(np.float64)
+
+            mean_direction_train_fraction = float(
+                np.dot(train_mean_energy, train_mean_energy)
+                / train_energy
+            )
+            mean_direction_test_fraction = float(
+                np.dot(
+                    test_mean_projection,
+                    test_mean_projection,
+                ) / test_energy
+            )
+
+            signed_test_mean = float(
+                np.mean(test_mean_projection)
+            )
+
+            mean_cosine = (
+                float(np.dot(previous_mean, mean_unit))
+                if previous_mean is not None
+                else float("nan")
+            )
+        else:
+            mean_unit = np.zeros_like(mean)
+            mean_direction_train_fraction = float("nan")
+            mean_direction_test_fraction = float("nan")
+            signed_test_mean = float("nan")
+            mean_cosine = float("nan")
+
+        train_projected = x @ basis.T
+        test_projected = heldout @ basis.T
+
+        train_subspace_energy = float(
+            np.sum(train_projected.astype(np.float64) ** 2)
+            / train_energy
+        )
+        test_subspace_energy = float(
+            np.sum(test_projected.astype(np.float64) ** 2)
+            / test_energy
+        )
+
+        train_mean_energy_fraction = float(
+            x.shape[0] * mean_norm ** 2 / train_energy
+        )
+
+        for component in range(actual_rank):
+            energy_rows.append({
+                "fold": fold,
+                "layer": layer,
+                "component": component + 1,
+                "singular_value_approx": float(s[component]),
+                "energy_fraction_approx": float(
+                    energy[component] / train_energy
+                ),
+                "cumulative_energy_fraction_approx": float(
+                    cumulative[component] / train_energy
+                ),
+                "total_train_energy": train_energy,
+                "mean_vector_norm": mean_norm,
+                "mean_energy_fraction": train_mean_energy_fraction,
+                "mean_direction_train_energy_fraction":
+                    mean_direction_train_fraction,
+                "mean_direction_test_energy_fraction":
+                    mean_direction_test_fraction,
+                "topk_train_energy_fraction":
+                    train_subspace_energy,
+                "topk_test_energy_fraction":
+                    test_subspace_energy,
+                "signed_test_mean_projection":
+                    signed_test_mean,
+            })
+
+        if previous_vectors is not None:
+            cosines, angles = principal_angles(
+                previous_vectors,
+                basis,
+            )
+
+            overlap_rows.append({
+                "fold": fold,
+                "layer_from": layer - 1,
+                "layer_to": layer,
+                "rank": actual_rank,
+                "mean_squared_principal_cosine": float(
+                    np.mean(cosines ** 2)
+                ),
+                "mean_principal_angle_deg": float(
+                    np.mean(angles)
+                ),
+                "max_principal_angle_deg": float(
+                    np.max(angles)
+                ),
+                "leading_vector_abs_cosine": float(
+                    abs(np.dot(
+                        previous_vectors[0],
+                        basis[0],
+                    ))
+                ),
+                "mean_direction_signed_cosine": mean_cosine,
+            })
+
+        previous_vectors = basis
+        previous_mean = mean_unit
+
+        print(
+            f"      fold={fold} layer={layer:02d}/{layers - 1:02d} "
+            f"top1={energy[0] / train_energy:.4f} "
+            f"top{actual_rank}={train_subspace_energy:.4f} "
+            f"heldout={test_subspace_energy:.4f}",
+            flush=True,
+        )
+
+    destination.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        destination / f"fold_{fold}_directions.npz",
+        vectors=vectors,
+        means=means,
+        singular_values_approx=singular_values,
+        layer_boundaries=np.arange(layers),
+        fold=np.array(fold),
+        rank=np.array(actual_rank),
+    )
+
+    return energy_rows, overlap_rows
+
+
+def run_model(model, rank, seed):
+    print(f"\n{'=' * 72}")
+    print(f"MODEL: {model}", flush=True)
+
+    assignments = check_complete_manifest(model)
+
+    output_root = (
+        RESULTS / model / "wk3/paired_harm_svd"
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    for modality in ("text", "audio"):
+        for component in MODELS[model]:
+            if component == "audio_encoder" and modality == "text":
+                continue
+
+            print(
+                f"\n  modality={modality} component={component}",
+                flush=True,
+            )
+
+            differences, keys = load_differences(
+                model,
+                modality,
+                component,
+            )
+
+            destination = output_root / modality / component
+
+            energy_rows = []
+            overlap_rows = []
+
+            for fold in FOLDS:
+                print(f"\n    ANALYZING FOLD {fold}", flush=True)
+
+                energy, overlap = analyze_fold(
+                    differences,
+                    keys,
+                    assignments,
+                    fold,
+                    rank,
+                    seed,
+                    destination,
+                )
+
+                energy_rows.extend(energy)
+                overlap_rows.extend(overlap)
+
+            write_csv(
+                destination / "singular_energy.csv",
+                energy_rows,
+                list(energy_rows[0].keys()),
+            )
+
+            write_csv(
+                destination / "adjacent_subspace_overlap.csv",
+                overlap_rows,
+                list(overlap_rows[0].keys()),
+            )
+
+            metadata = {
+                "model": model,
+                "modality": modality,
+                "component": component,
+                "seed": seed,
+                "rank": rank,
+                "folds": 5,
+                "topic_indices": 100,
+                "training_topic_indices_per_fold": 80,
+                "test_topic_indices_per_fold": 20,
+                "paired_differences": 1600,
+                "train_differences_per_fold": 1280,
+                "test_differences_per_fold": 320,
+                "difference_definition": "harmful_minus_benign",
+                "svd": "uncentered_randomized_svd",
+                "randomized_svd_power_iterations": 2,
+                "energy_denominator": "uncentered_frobenius_norm_squared",
+                "audio_encoder_temporal_pooling":
+                    "arithmetic_mean_of_8_bins"
+                    if component == "audio_encoder" else None,
+                "representation_source": str(
+                    RESULTS / model / "5fold/representations_shared"
+                ),
+                "fold_source": str(
+                    RESULTS / model / "wk3/dataset_summary/folds"
+                ),
+                "interpretation": (
+                    "Leading singular values are approximate. "
+                    "Total Frobenius energy is exact up to "
+                    "floating-point arithmetic. "
+                    "Subspaces are descriptive and are not "
+                    "causally identified harm-recognition mechanisms."
+                ),
+            }
+
+            (destination / "metadata.json").write_text(
+                json.dumps(metadata, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            del differences
+
+            print(
+                f"\n  SAVED: {destination}",
+                flush=True,
+            )
+
+    print(f"\nCOMPLETE: {model}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        choices=tuple(MODELS),
+        default=list(MODELS),
+    )
+    parser.add_argument("--rank", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    if args.rank < 1 or args.rank > 32:
+        parser.error("--rank must be between 1 and 32")
+
+    torch.set_num_threads(4)
+
+    for model in args.models:
+        run_model(model, args.rank, args.seed)
+
+
+if __name__ == "__main__":
+    main()
